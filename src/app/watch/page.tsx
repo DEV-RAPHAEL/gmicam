@@ -24,7 +24,6 @@ function CameraTile({
     waiting: 'bg-yellow-500',
     connecting: 'bg-yellow-500 animate-pulse',
     connected: 'bg-green-500',
-    error: 'bg-red-500',
   };
 
   return (

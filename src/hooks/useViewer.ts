@@ -2,26 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-export type ViewerStatus = 'waiting' | 'connecting' | 'connected' | 'error';
+export type ViewerStatus = 'waiting' | 'connecting' | 'connected';
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  {
-    urls: 'turn:openrelay.metered.ca:80',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-  {
-    urls: 'turn:openrelay.metered.ca:443',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-  {
-    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 
 async function signal(room: string, type: string, data?: unknown) {
@@ -33,31 +21,28 @@ async function signal(room: string, type: string, data?: unknown) {
 }
 
 export function useViewer(room: string) {
-  const pcRef = useRef<RTCPeerConnection | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const [status, setStatus] = useState<ViewerStatus>('waiting');
-  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const connectingRef = useRef(false);
-  const activeRef = useRef(true);
-  const lastOfferRef = useRef<string>('');
 
-  const cleanup = useCallback(() => {
-    if (pollRef.current) clearTimeout(pollRef.current);
-    connectingRef.current = false;
+  // Generation counter — increment to invalidate any in-flight async work
+  const genRef = useRef(0);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastOfferSdpRef = useRef<string>(''); // tracks which offer we're connected to
+
+  const clearTimer = () => { if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; } };
+
+  const closePC = useCallback(() => {
     pcRef.current?.close();
     pcRef.current = null;
   }, []);
 
-  const connect = useCallback(() => {
-    cleanup();
-    activeRef.current = true;
-    setStatus('waiting');
-    lastOfferRef.current = '';
+  const loop = useCallback((gen: number) => {
+    clearTimer();
 
-    let knownBroadcasterCandidates = 0;
+    const run = async () => {
+      if (genRef.current !== gen) return; // stale — a newer loop took over
 
-    const tryConnect = async () => {
-      if (!activeRef.current) return;
       try {
         const res = await fetch(`/api/signal?room=${encodeURIComponent(room)}`);
         const state = await res.json() as {
@@ -66,35 +51,28 @@ export function useViewer(room: string) {
           version: number;
         };
 
+        if (genRef.current !== gen) return;
+
         if (!state.offer) {
-          pollRef.current = setTimeout(tryConnect, 1200);
+          // No broadcaster yet — keep waiting
+          setStatus('waiting');
+          closePC();
+          lastOfferSdpRef.current = '';
+          timerRef.current = setTimeout(() => loop(gen), 1200);
           return;
         }
 
-        // Fingerprint the offer to detect when broadcaster restarts
-        const offerKey = JSON.stringify(state.offer).slice(0, 80);
-        if (offerKey === lastOfferRef.current && pcRef.current) {
-          // Same offer, we're already connected — poll for ICE only
-          const newCandidates = state.broadcasterCandidates.slice(knownBroadcasterCandidates);
-          for (const c of newCandidates) {
-            try { await pcRef.current.addIceCandidate(c); } catch { /* ignore */ }
-          }
-          knownBroadcasterCandidates = state.broadcasterCandidates.length;
-          pollRef.current = setTimeout(tryConnect, 1000);
+        const offerSdp = state.offer.sdp ?? '';
+
+        // If we're already connected to this exact offer, just keep polling for new ICE
+        if (pcRef.current && offerSdp === lastOfferSdpRef.current && pcRef.current.connectionState === 'connected') {
+          timerRef.current = setTimeout(() => loop(gen), 1000);
           return;
         }
 
-        if (connectingRef.current) {
-          pollRef.current = setTimeout(tryConnect, 1200);
-          return;
-        }
-
-        // New offer — (re)connect
-        pcRef.current?.close();
-        pcRef.current = null;
-        connectingRef.current = true;
-        lastOfferRef.current = offerKey;
-        knownBroadcasterCandidates = 0;
+        // New offer (broadcaster restarted or first connection) — connect
+        closePC();
+        lastOfferSdpRef.current = offerSdp;
         setStatus('connecting');
 
         const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
@@ -107,56 +85,87 @@ export function useViewer(room: string) {
         };
 
         pc.onicecandidate = (e) => {
-          if (e.candidate) signal(room, 'ice-viewer', e.candidate.toJSON());
+          if (e.candidate && genRef.current === gen) {
+            signal(room, 'ice-viewer', e.candidate.toJSON());
+          }
         };
 
         pc.onconnectionstatechange = () => {
+          if (genRef.current !== gen) return;
           const s = pc.connectionState;
-          if (s === 'connected') { setStatus('connected'); connectingRef.current = false; }
-          if (s === 'disconnected' || s === 'failed') {
-            connectingRef.current = false;
+          if (s === 'connected') setStatus('connected');
+          if (s === 'disconnected' || s === 'failed' || s === 'closed') {
+            // Tear down and immediately re-enter the loop
+            pcRef.current?.close();
+            pcRef.current = null;
+            lastOfferSdpRef.current = '';
             setStatus('waiting');
-            if (activeRef.current) pollRef.current = setTimeout(tryConnect, 1500);
+            loop(gen);
           }
         };
 
         await pc.setRemoteDescription(state.offer);
 
+        let knownCandidates = state.broadcasterCandidates.length;
         for (const c of state.broadcasterCandidates) {
-          try { await pc.addIceCandidate(c); } catch { /* ignore */ }
+          try { await pc.addIceCandidate(c); } catch { /* ok */ }
         }
-        knownBroadcasterCandidates = state.broadcasterCandidates.length;
 
         const answer = await pc.createAnswer();
+        if (genRef.current !== gen) { pc.close(); return; }
         await pc.setLocalDescription(answer);
         await signal(room, 'answer', answer);
-        connectingRef.current = false;
+
+        // Poll for new broadcaster ICE candidates
+        const pollICE = async () => {
+          if (genRef.current !== gen || !pcRef.current) return;
+          try {
+            const r = await fetch(`/api/signal?room=${encodeURIComponent(room)}`);
+            const s = await r.json() as { broadcasterCandidates: RTCIceCandidateInit[]; offer: RTCSessionDescriptionInit | null };
+            // If the offer changed, broadcaster restarted — re-enter main loop
+            if (!s.offer || (s.offer.sdp ?? '') !== lastOfferSdpRef.current) {
+              lastOfferSdpRef.current = '';
+              timerRef.current = setTimeout(() => loop(gen), 300);
+              return;
+            }
+            const newOnes = s.broadcasterCandidates.slice(knownCandidates);
+            for (const c of newOnes) { try { await pc.addIceCandidate(c); } catch { /* ok */ } }
+            knownCandidates = s.broadcasterCandidates.length;
+          } catch { /* ok */ }
+          if (genRef.current === gen) timerRef.current = setTimeout(pollICE, 800);
+        };
+        pollICE();
 
       } catch (err) {
         console.error(`[Viewer:${room}]`, err);
-        connectingRef.current = false;
-        if (activeRef.current) pollRef.current = setTimeout(tryConnect, 2000);
-      }
-
-      if (activeRef.current && pollRef.current === null) {
-        pollRef.current = setTimeout(tryConnect, 1000);
+        if (genRef.current === gen) timerRef.current = setTimeout(() => loop(gen), 2000);
       }
     };
 
-    tryConnect();
-  }, [cleanup, room]);
+    run();
+  }, [room, closePC]);
+
+  const connect = useCallback(() => {
+    const gen = ++genRef.current;
+    closePC();
+    lastOfferSdpRef.current = '';
+    setStatus('waiting');
+    loop(gen);
+  }, [closePC, loop]);
 
   const disconnect = useCallback(() => {
-    activeRef.current = false;
-    cleanup();
+    ++genRef.current; // invalidate all in-flight work
+    clearTimer();
+    closePC();
+    lastOfferSdpRef.current = '';
     setStatus('waiting');
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-  }, [cleanup]);
+  }, [closePC]);
 
   useEffect(() => {
     connect();
-    return () => { activeRef.current = false; cleanup(); };
-  }, [connect, cleanup]);
+    return () => disconnect();
+  }, [connect, disconnect]);
 
   return { status, remoteVideoRef, connect, disconnect };
 }

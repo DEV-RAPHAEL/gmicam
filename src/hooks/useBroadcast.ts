@@ -4,25 +4,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 export type BroadcastStatus = 'idle' | 'offering' | 'waiting' | 'connected' | 'error';
 
-// Public STUN + free TURN via OpenRelay for cross-network connectivity
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  {
-    urls: 'turn:openrelay.metered.ca:80',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-  {
-    urls: 'turn:openrelay.metered.ca:443',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-  {
-    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 
 async function signal(room: string, type: string, data?: unknown) {
@@ -34,33 +21,30 @@ async function signal(room: string, type: string, data?: unknown) {
 }
 
 export function useBroadcast(room: string, streamRef: React.RefObject<MediaStream | null>) {
-  const pcRef = useRef<RTCPeerConnection | null>(null);
   const [status, setStatus] = useState<BroadcastStatus>('idle');
-  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const genRef = useRef(0);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const activeRef = useRef(false);
 
-  const cleanup = useCallback(async () => {
-    activeRef.current = false;
-    if (pollRef.current) clearTimeout(pollRef.current);
-    if (heartbeatRef.current) clearInterval(heartbeatRef.current);
-    pcRef.current?.close();
-    pcRef.current = null;
-    await signal(room, 'reset').catch(() => {});
-  }, [room]);
+  const clearTimers = () => {
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+    if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
+  };
 
-  const start = useCallback(async () => {
+  const offer = useCallback(async (gen: number) => {
+    if (genRef.current !== gen) return;
+
     const stream = streamRef.current;
-    if (!stream || stream.getTracks().length === 0) return;
-
-    if (pcRef.current) {
-      // Already running — don't restart
+    if (!stream || stream.getTracks().length === 0) {
+      // Stream not ready yet — retry shortly
+      timerRef.current = setTimeout(() => offer(gen), 500);
       return;
     }
 
     setStatus('offering');
-    activeRef.current = true;
     await signal(room, 'reset');
+    if (genRef.current !== gen) return;
 
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
     pcRef.current = pc;
@@ -68,36 +52,41 @@ export function useBroadcast(room: string, streamRef: React.RefObject<MediaStrea
     stream.getTracks().forEach((t) => pc.addTrack(t, stream));
 
     pc.onicecandidate = (e) => {
-      if (e.candidate) signal(room, 'ice-broadcaster', e.candidate.toJSON());
-    };
-
-    pc.onconnectionstatechange = () => {
-      const s = pc.connectionState;
-      if (s === 'connected') setStatus('connected');
-      if (s === 'disconnected' || s === 'failed') {
-        setStatus('waiting');
-        // Viewer dropped — re-offer so they can reconnect
-        pcRef.current?.close();
-        pcRef.current = null;
-        if (activeRef.current) setTimeout(() => start(), 1000);
+      if (e.candidate && genRef.current === gen) {
+        signal(room, 'ice-broadcaster', e.candidate.toJSON());
       }
     };
 
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await signal(room, 'offer', offer);
+    pc.onconnectionstatechange = () => {
+      if (genRef.current !== gen) return;
+      const s = pc.connectionState;
+      if (s === 'connected') setStatus('connected');
+      if (s === 'disconnected' || s === 'failed' || s === 'closed') {
+        // Clean up and re-offer automatically — viewer can reconnect at any time
+        pc.close();
+        if (pcRef.current === pc) pcRef.current = null;
+        clearTimers();
+        setStatus('waiting');
+        timerRef.current = setTimeout(() => offer(gen), 800);
+      }
+    };
+
+    const sdpOffer = await pc.createOffer();
+    if (genRef.current !== gen) { pc.close(); return; }
+    await pc.setLocalDescription(sdpOffer);
+    await signal(room, 'offer', sdpOffer);
     setStatus('waiting');
 
-    // Heartbeat keeps room alive in the store
+    // Heartbeat keeps room alive
     heartbeatRef.current = setInterval(() => {
-      if (activeRef.current) signal(room, 'heartbeat');
+      if (genRef.current === gen) signal(room, 'heartbeat');
     }, 10_000);
 
     let knownViewerCandidates = 0;
     let lastVersion = -1;
 
     const poll = async () => {
-      if (!pcRef.current || !activeRef.current) return;
+      if (genRef.current !== gen || !pcRef.current) return;
       try {
         const res = await fetch(`/api/signal?room=${encodeURIComponent(room)}`);
         const state = await res.json() as {
@@ -106,45 +95,52 @@ export function useBroadcast(room: string, streamRef: React.RefObject<MediaStrea
           version: number;
         };
 
+        if (genRef.current !== gen) return;
+
         if (state.version !== lastVersion) {
           lastVersion = state.version;
-
           if (state.answer && pc.remoteDescription === null) {
             await pc.setRemoteDescription(state.answer);
           }
-
-          const newCandidates = state.viewerCandidates.slice(knownViewerCandidates);
-          for (const c of newCandidates) {
-            try { await pc.addIceCandidate(c); } catch { /* ignore */ }
-          }
+          const newOnes = state.viewerCandidates.slice(knownViewerCandidates);
+          for (const c of newOnes) { try { await pc.addIceCandidate(c); } catch { /* ok */ } }
           knownViewerCandidates = state.viewerCandidates.length;
         }
-      } catch { /* network hiccup */ }
-
-      if (activeRef.current) pollRef.current = setTimeout(poll, 800);
+      } catch { /* ok */ }
+      if (genRef.current === gen) timerRef.current = setTimeout(poll, 800);
     };
 
     poll();
   }, [room, streamRef]);
 
-  // Replace the video track in the existing peer connection (no renegotiation)
+  const start = useCallback(() => {
+    const gen = ++genRef.current;
+    clearTimers();
+    pcRef.current?.close();
+    pcRef.current = null;
+    offer(gen);
+  }, [offer]);
+
+  const stop = useCallback(async () => {
+    ++genRef.current;
+    clearTimers();
+    pcRef.current?.close();
+    pcRef.current = null;
+    await signal(room, 'reset').catch(() => {});
+    setStatus('idle');
+  }, [room]);
+
+  // Replace video track without renegotiating
   const replaceTrack = useCallback(async (newStream: MediaStream) => {
     const pc = pcRef.current;
     if (!pc) return;
-    const newTrack = newStream.getVideoTracks()[0];
-    if (!newTrack) return;
+    const track = newStream.getVideoTracks()[0];
+    if (!track) return;
     const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
-    if (sender) {
-      await sender.replaceTrack(newTrack);
-    }
+    if (sender) await sender.replaceTrack(track);
   }, []);
 
-  const stop = useCallback(async () => {
-    await cleanup();
-    setStatus('idle');
-  }, [cleanup]);
-
-  useEffect(() => () => { cleanup(); }, [cleanup]);
+  useEffect(() => () => { stop(); }, [stop]);
 
   return { status, start, stop, replaceTrack };
 }
