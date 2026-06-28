@@ -5,10 +5,15 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 export type ViewerStatus = 'waiting' | 'connecting' | 'connected';
 
 const ICE_SERVERS: RTCIceServer[] = [
+  // Multiple STUN providers for redundancy
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  { urls: 'stun:stun.stunprotocol.org:3478' },
+  // TURN — openrelay (free, best-effort)
+  { urls: 'turn:openrelay.metered.ca:80',            username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443',           username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 
@@ -23,12 +28,12 @@ async function signal(room: string, type: string, data?: unknown) {
 export function useViewer(room: string) {
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const [status, setStatus] = useState<ViewerStatus>('waiting');
+  const [iceState, setIceState] = useState<string>('');
 
-  // Generation counter — increment to invalidate any in-flight async work
   const genRef = useRef(0);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastOfferSdpRef = useRef<string>(''); // tracks which offer we're connected to
+  const lastOfferSdpRef = useRef<string>('');
 
   const clearTimer = () => { if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; } };
 
@@ -41,20 +46,18 @@ export function useViewer(room: string) {
     clearTimer();
 
     const run = async () => {
-      if (genRef.current !== gen) return; // stale — a newer loop took over
+      if (genRef.current !== gen) return;
 
       try {
         const res = await fetch(`/api/signal?room=${encodeURIComponent(room)}`);
         const state = await res.json() as {
           offer: RTCSessionDescriptionInit | null;
           broadcasterCandidates: RTCIceCandidateInit[];
-          version: number;
         };
 
         if (genRef.current !== gen) return;
 
         if (!state.offer) {
-          // No broadcaster yet — keep waiting
           setStatus('waiting');
           closePC();
           lastOfferSdpRef.current = '';
@@ -64,13 +67,14 @@ export function useViewer(room: string) {
 
         const offerSdp = state.offer.sdp ?? '';
 
-        // If we're already connected to this exact offer, just keep polling for new ICE
-        if (pcRef.current && offerSdp === lastOfferSdpRef.current && pcRef.current.connectionState === 'connected') {
+        // Already connected to this exact offer — just keep polling for new ICE
+        if (pcRef.current && offerSdp === lastOfferSdpRef.current &&
+          (pcRef.current.connectionState === 'connected' || pcRef.current.iceConnectionState === 'connected' || pcRef.current.iceConnectionState === 'completed')) {
           timerRef.current = setTimeout(() => loop(gen), 1000);
           return;
         }
 
-        // New offer (broadcaster restarted or first connection) — connect
+        // New offer — (re)connect
         closePC();
         lastOfferSdpRef.current = offerSdp;
         setStatus('connecting');
@@ -90,17 +94,38 @@ export function useViewer(room: string) {
           }
         };
 
+        // Listen to BOTH connectionState AND iceConnectionState
+        // Some browsers/networks get ICE connected but connectionState stays 'connecting'
+        const markConnected = () => {
+          if (genRef.current === gen) setStatus('connected');
+        };
+
         pc.onconnectionstatechange = () => {
           if (genRef.current !== gen) return;
           const s = pc.connectionState;
-          if (s === 'connected') setStatus('connected');
+          setIceState(`pc:${s} ice:${pc.iceConnectionState}`);
+          if (s === 'connected') markConnected();
           if (s === 'disconnected' || s === 'failed' || s === 'closed') {
-            // Tear down and immediately re-enter the loop
             pcRef.current?.close();
             pcRef.current = null;
             lastOfferSdpRef.current = '';
             setStatus('waiting');
             loop(gen);
+          }
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          if (genRef.current !== gen) return;
+          const s = pc.iceConnectionState;
+          setIceState(`pc:${pc.connectionState} ice:${s}`);
+          if (s === 'connected' || s === 'completed') markConnected();
+          if (s === 'failed') {
+            // ICE failed — try restarting
+            pcRef.current?.close();
+            pcRef.current = null;
+            lastOfferSdpRef.current = '';
+            setStatus('waiting');
+            timerRef.current = setTimeout(() => loop(gen), 1000);
           }
         };
 
@@ -122,7 +147,6 @@ export function useViewer(room: string) {
           try {
             const r = await fetch(`/api/signal?room=${encodeURIComponent(room)}`);
             const s = await r.json() as { broadcasterCandidates: RTCIceCandidateInit[]; offer: RTCSessionDescriptionInit | null };
-            // If the offer changed, broadcaster restarted — re-enter main loop
             if (!s.offer || (s.offer.sdp ?? '') !== lastOfferSdpRef.current) {
               lastOfferSdpRef.current = '';
               timerRef.current = setTimeout(() => loop(gen), 300);
@@ -132,7 +156,7 @@ export function useViewer(room: string) {
             for (const c of newOnes) { try { await pc.addIceCandidate(c); } catch { /* ok */ } }
             knownCandidates = s.broadcasterCandidates.length;
           } catch { /* ok */ }
-          if (genRef.current === gen) timerRef.current = setTimeout(pollICE, 800);
+          if (genRef.current === gen) timerRef.current = setTimeout(pollICE, 600);
         };
         pollICE();
 
@@ -154,7 +178,7 @@ export function useViewer(room: string) {
   }, [closePC, loop]);
 
   const disconnect = useCallback(() => {
-    ++genRef.current; // invalidate all in-flight work
+    ++genRef.current;
     clearTimer();
     closePC();
     lastOfferSdpRef.current = '';
@@ -167,5 +191,5 @@ export function useViewer(room: string) {
     return () => disconnect();
   }, [connect, disconnect]);
 
-  return { status, remoteVideoRef, connect, disconnect };
+  return { status, iceState, remoteVideoRef, connect, disconnect };
 }
