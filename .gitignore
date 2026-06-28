@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Next.js
+.next/
+out/
+dist/
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Misc
+.DS_Store
+*.log
+.netlify/
