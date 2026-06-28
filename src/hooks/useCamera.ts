@@ -27,7 +27,7 @@ export function useCamera() {
   const [devices, setDevices] = useState<CameraDevice[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
   const [facingMode, setFacingMode] = useState<FacingMode>('user');
-  const [mirror, setMirror] = useState(true);
+  const [mirror, setMirror] = useState(false);
   const [fps, setFps] = useState<FpsOption>(30);
   const [actualResolution, setActualResolution] = useState<{ w: number; h: number } | null>(null);
 

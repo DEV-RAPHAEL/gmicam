@@ -59,7 +59,7 @@ export async function deleteRoom(room: string): Promise<void> {
 
 // Returns rooms with an active offer seen in the last 60 seconds
 export async function listActiveRooms(): Promise<string[]> {
-  const cutoff = Date.now() - 60_000;
+  const cutoff = Date.now() - 300_000; // 5 minutes
   if (isNetlify) {
     const store = await getBlobStore();
     const { blobs } = await store.list();

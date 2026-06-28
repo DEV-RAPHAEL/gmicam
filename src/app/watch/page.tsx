@@ -38,6 +38,8 @@ function CameraTile({
         className="w-full h-full object-cover"
         style={{ minHeight: 160 }}
         onLoadedMetadata={(e) => (e.currentTarget as HTMLVideoElement).play()}
+        onStalled={(e) => (e.currentTarget as HTMLVideoElement).play().catch(() => {})}
+        onSuspend={(e) => (e.currentTarget as HTMLVideoElement).play().catch(() => {})}
       />
 
       {/* Waiting overlay */}
@@ -100,6 +102,8 @@ function ExpandedView({ room, onClose }: { room: string; onClose: () => void }) 
         autoPlay playsInline
         className="flex-1 w-full object-contain"
         onLoadedMetadata={(e) => (e.currentTarget as HTMLVideoElement).play()}
+        onStalled={(e) => (e.currentTarget as HTMLVideoElement).play().catch(() => {})}
+        onSuspend={(e) => (e.currentTarget as HTMLVideoElement).play().catch(() => {})}
       />
 
       {status !== 'connected' && (
@@ -140,6 +144,8 @@ function SingleRoomObs({ room }: { room: string }) {
         autoPlay playsInline
         className="w-full h-full object-cover"
         onLoadedMetadata={(e) => (e.currentTarget as HTMLVideoElement).play()}
+        onStalled={(e) => (e.currentTarget as HTMLVideoElement).play().catch(() => {})}
+        onSuspend={(e) => (e.currentTarget as HTMLVideoElement).play().catch(() => {})}
       />
     </div>
   );

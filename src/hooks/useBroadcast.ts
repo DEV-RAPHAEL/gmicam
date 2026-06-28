@@ -60,7 +60,19 @@ export function useBroadcast(room: string, streamRef: React.RefObject<MediaStrea
     pc.onconnectionstatechange = () => {
       if (genRef.current !== gen) return;
       const s = pc.connectionState;
-      if (s === 'connected') setStatus('connected');
+      if (s === 'connected') {
+        setStatus('connected');
+        // Cap bitrate and prefer dropping resolution over frames on poor networks
+        pc.getSenders().forEach(async (sender) => {
+          if (sender.track?.kind !== 'video') return;
+          try {
+            const params = sender.getParameters();
+            if (!params.encodings?.length) params.encodings = [{}];
+            params.encodings[0].maxBitrate = 4_000_000; // 4 Mbps ceiling
+            await sender.setParameters(params);
+          } catch { /* not all browsers support this */ }
+        });
+      }
       if (s === 'disconnected' || s === 'failed' || s === 'closed') {
         // Clean up and re-offer automatically — viewer can reconnect at any time
         pc.close();
@@ -77,10 +89,10 @@ export function useBroadcast(room: string, streamRef: React.RefObject<MediaStrea
     await signal(room, 'offer', sdpOffer);
     setStatus('waiting');
 
-    // Heartbeat keeps room alive
+    // Heartbeat keeps room alive — every 4s so a few failures don't expire the room
     heartbeatRef.current = setInterval(() => {
-      if (genRef.current === gen) signal(room, 'heartbeat');
-    }, 10_000);
+      if (genRef.current === gen) signal(room, 'heartbeat').catch(() => {});
+    }, 4_000);
 
     let knownViewerCandidates = 0;
     let lastVersion = -1;
