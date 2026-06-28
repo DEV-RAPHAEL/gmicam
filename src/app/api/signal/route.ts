@@ -1,25 +1,39 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { readState, writeState, resetState, SignalState } from '@/lib/signalStore';
+import { readRoom, writeRoom, deleteRoom, listActiveRooms, RoomState } from '@/lib/signalStore';
 
 export const dynamic = 'force-dynamic';
 
-export async function GET() {
-  const state = await readState();
+// GET /api/signal?room=cam1        — state for one room
+// GET /api/signal?list=1           — list active room IDs
+export async function GET(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+
+  if (searchParams.get('list') === '1') {
+    const rooms = await listActiveRooms();
+    return NextResponse.json({ rooms });
+  }
+
+  const room = searchParams.get('room') ?? 'default';
+  const state = await readRoom(room);
   return NextResponse.json(state);
 }
 
+// POST /api/signal?room=cam1       — write a signal message
 export async function POST(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+  const room = searchParams.get('room') ?? 'default';
+
   const body = await req.json() as {
-    type: 'offer' | 'answer' | 'ice-broadcaster' | 'ice-viewer' | 'reset';
+    type: 'offer' | 'answer' | 'ice-broadcaster' | 'ice-viewer' | 'reset' | 'heartbeat';
     data?: RTCSessionDescriptionInit | RTCIceCandidateInit;
   };
 
   if (body.type === 'reset') {
-    await resetState();
+    await deleteRoom(room);
     return NextResponse.json({ ok: true });
   }
 
-  const state: SignalState = await readState();
+  const state: RoomState = await readRoom(room);
 
   switch (body.type) {
     case 'offer':
@@ -37,9 +51,12 @@ export async function POST(req: NextRequest) {
     case 'ice-viewer':
       state.viewerCandidates.push(body.data as RTCIceCandidateInit);
       break;
+    case 'heartbeat':
+      // just bumps lastSeen
+      break;
   }
 
   state.version++;
-  await writeState(state);
+  await writeRoom(room, state);
   return NextResponse.json({ ok: true, version: state.version });
 }

@@ -2,27 +2,44 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-export type ViewerStatus = 'idle' | 'waiting' | 'connecting' | 'connected' | 'error';
+export type ViewerStatus = 'waiting' | 'connecting' | 'connected' | 'error';
 
-const ICE_SERVERS = [
+const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
+  {
+    urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
 ];
 
-async function signal(type: string, data?: unknown) {
-  await fetch('/api/signal', {
+async function signal(room: string, type: string, data?: unknown) {
+  await fetch(`/api/signal?room=${encodeURIComponent(room)}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ type, data }),
   });
 }
 
-export function useViewer() {
+export function useViewer(room: string) {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
-  const [status, setStatus] = useState<ViewerStatus>('idle');
+  const [status, setStatus] = useState<ViewerStatus>('waiting');
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const connectingRef = useRef(false);
+  const activeRef = useRef(true);
+  const lastOfferRef = useRef<string>('');
 
   const cleanup = useCallback(() => {
     if (pollRef.current) clearTimeout(pollRef.current);
@@ -33,71 +50,78 @@ export function useViewer() {
 
   const connect = useCallback(() => {
     cleanup();
+    activeRef.current = true;
     setStatus('waiting');
+    lastOfferRef.current = '';
 
     let knownBroadcasterCandidates = 0;
-    let lastSeenVersion = -1;
 
     const tryConnect = async () => {
+      if (!activeRef.current) return;
       try {
-        const res = await fetch('/api/signal');
+        const res = await fetch(`/api/signal?room=${encodeURIComponent(room)}`);
         const state = await res.json() as {
           offer: RTCSessionDescriptionInit | null;
           broadcasterCandidates: RTCIceCandidateInit[];
           version: number;
         };
 
-        console.log('[Viewer] poll — version:', state.version, 'has offer:', !!state.offer);
-
         if (!state.offer) {
           pollRef.current = setTimeout(tryConnect, 1200);
           return;
         }
 
-        // Avoid re-connecting if we already processed this offer
-        if (state.version === lastSeenVersion) {
+        // Fingerprint the offer to detect when broadcaster restarts
+        const offerKey = JSON.stringify(state.offer).slice(0, 80);
+        if (offerKey === lastOfferRef.current && pcRef.current) {
+          // Same offer, we're already connected — poll for ICE only
+          const newCandidates = state.broadcasterCandidates.slice(knownBroadcasterCandidates);
+          for (const c of newCandidates) {
+            try { await pcRef.current.addIceCandidate(c); } catch { /* ignore */ }
+          }
+          knownBroadcasterCandidates = state.broadcasterCandidates.length;
+          pollRef.current = setTimeout(tryConnect, 1000);
+          return;
+        }
+
+        if (connectingRef.current) {
           pollRef.current = setTimeout(tryConnect, 1200);
           return;
         }
-        lastSeenVersion = state.version;
 
-        if (connectingRef.current || pcRef.current) {
-          pollRef.current = setTimeout(tryConnect, 1200);
-          return;
-        }
-
+        // New offer — (re)connect
+        pcRef.current?.close();
+        pcRef.current = null;
         connectingRef.current = true;
+        lastOfferRef.current = offerKey;
+        knownBroadcasterCandidates = 0;
         setStatus('connecting');
 
         const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
         pcRef.current = pc;
 
         pc.ontrack = (e) => {
-          console.log('[Viewer] got remote track');
           if (remoteVideoRef.current && e.streams[0]) {
             remoteVideoRef.current.srcObject = e.streams[0];
           }
         };
 
         pc.onicecandidate = (e) => {
-          if (e.candidate) signal('ice-viewer', e.candidate.toJSON());
+          if (e.candidate) signal(room, 'ice-viewer', e.candidate.toJSON());
         };
 
         pc.onconnectionstatechange = () => {
           const s = pc.connectionState;
-          console.log('[Viewer] connection state:', s);
-          if (s === 'connected') setStatus('connected');
+          if (s === 'connected') { setStatus('connected'); connectingRef.current = false; }
           if (s === 'disconnected' || s === 'failed') {
             connectingRef.current = false;
-            pcRef.current = null;
             setStatus('waiting');
-            pollRef.current = setTimeout(tryConnect, 1500);
+            if (activeRef.current) pollRef.current = setTimeout(tryConnect, 1500);
           }
         };
 
         await pc.setRemoteDescription(state.offer);
 
-        // Add broadcaster ICE candidates we already know about
         for (const c of state.broadcasterCandidates) {
           try { await pc.addIceCandidate(c); } catch { /* ignore */ }
         }
@@ -105,42 +129,34 @@ export function useViewer() {
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        await signal('answer', answer);
+        await signal(room, 'answer', answer);
         connectingRef.current = false;
-
-        // Poll for new broadcaster ICE candidates
-        const pollIce = async () => {
-          if (!pcRef.current) return;
-          try {
-            const r = await fetch('/api/signal');
-            const s = await r.json() as { broadcasterCandidates: RTCIceCandidateInit[]; version: number };
-            const newOnes = s.broadcasterCandidates.slice(knownBroadcasterCandidates);
-            for (const c of newOnes) {
-              try { await pc.addIceCandidate(c); } catch { /* ignore */ }
-            }
-            knownBroadcasterCandidates = s.broadcasterCandidates.length;
-          } catch { /* ignore */ }
-          if (pcRef.current) pollRef.current = setTimeout(pollIce, 800);
-        };
-        pollIce();
 
       } catch (err) {
-        console.error('[Viewer] error:', err);
+        console.error(`[Viewer:${room}]`, err);
         connectingRef.current = false;
-        pollRef.current = setTimeout(tryConnect, 2000);
+        if (activeRef.current) pollRef.current = setTimeout(tryConnect, 2000);
+      }
+
+      if (activeRef.current && pollRef.current === null) {
+        pollRef.current = setTimeout(tryConnect, 1000);
       }
     };
 
     tryConnect();
-  }, [cleanup]);
+  }, [cleanup, room]);
 
   const disconnect = useCallback(() => {
+    activeRef.current = false;
     cleanup();
-    setStatus('idle');
+    setStatus('waiting');
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
   }, [cleanup]);
 
-  useEffect(() => () => cleanup(), [cleanup]);
+  useEffect(() => {
+    connect();
+    return () => { activeRef.current = false; cleanup(); };
+  }, [connect, cleanup]);
 
-  return { status, connect, disconnect, remoteVideoRef };
+  return { status, remoteVideoRef, connect, disconnect };
 }
