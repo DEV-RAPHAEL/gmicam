@@ -15,8 +15,10 @@ let cached: { servers: RTCIceServer[]; at: number } | null = null;
 const CACHE_MS = 5 * 60 * 1000;
 
 export async function GET() {
-  const domain = process.env.METERED_DOMAIN; // e.g. gmicam.metered.live
-  const apiKey = process.env.METERED_API_KEY;
+  // Env vars take precedence; fallbacks keep this working without Netlify env setup.
+  // Note: repo is public — rotate the key at dashboard.metered.ca if quota gets abused.
+  const domain = process.env.METERED_DOMAIN ?? 'gmimedia.metered.live';
+  const apiKey = process.env.METERED_API_KEY ?? 'a4c4e72fbc9a1f8b5be4d3ac52bf8567ae1c';
 
   if (!domain || !apiKey) {
     return NextResponse.json({ iceServers: FALLBACK, turn: false });
