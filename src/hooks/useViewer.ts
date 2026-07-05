@@ -1,21 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { fetchIceServers } from '@/lib/ice';
 
 export type ViewerStatus = 'waiting' | 'connecting' | 'connected';
-
-const ICE_SERVERS: RTCIceServer[] = [
-  // Multiple STUN providers for redundancy
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun.cloudflare.com:3478' },
-  { urls: 'stun:stun.stunprotocol.org:3478' },
-  // TURN — openrelay (free, best-effort)
-  { urls: 'turn:openrelay.metered.ca:80',            username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443',           username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-];
 
 async function signal(room: string, type: string, data?: unknown) {
   await fetch(`/api/signal?room=${encodeURIComponent(room)}`, {
@@ -79,7 +67,9 @@ export function useViewer(room: string) {
         lastOfferSdpRef.current = offerSdp;
         setStatus('connecting');
 
-        const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+        const iceServers = await fetchIceServers();
+        if (genRef.current !== gen) return;
+        const pc = new RTCPeerConnection({ iceServers });
         pcRef.current = pc;
 
         pc.ontrack = (e) => {

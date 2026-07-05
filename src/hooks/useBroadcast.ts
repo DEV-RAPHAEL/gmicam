@@ -1,16 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { fetchIceServers } from '@/lib/ice';
 
 export type BroadcastStatus = 'idle' | 'offering' | 'waiting' | 'connected' | 'error';
-
-const ICE_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-];
 
 async function signal(room: string, type: string, data?: unknown) {
   await fetch(`/api/signal?room=${encodeURIComponent(room)}`, {
@@ -46,7 +39,9 @@ export function useBroadcast(room: string, streamRef: React.RefObject<MediaStrea
     await signal(room, 'reset');
     if (genRef.current !== gen) return;
 
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const iceServers = await fetchIceServers();
+    if (genRef.current !== gen) return;
+    const pc = new RTCPeerConnection({ iceServers });
     pcRef.current = pc;
 
     stream.getTracks().forEach((t) => pc.addTrack(t, stream));
