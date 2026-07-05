@@ -25,7 +25,7 @@ function CameraTile({ room, onExpand, obsMode }: { room: string; onExpand: (r: s
       <video
         ref={remoteVideoRef}
         autoPlay playsInline
-        className="w-full h-full object-cover"
+        className="w-full h-full object-contain"
         style={{ minHeight: 160 }}
         onLoadedMetadata={(e) => (e.currentTarget as HTMLVideoElement).play()}
         onStalled={(e) => (e.currentTarget as HTMLVideoElement).play().catch(() => {})}
@@ -85,9 +85,10 @@ function ExpandedView({ room, onClose }: { room: string; onClose: () => void }) 
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  // OBS URL now points to broadcast page — OBS captures the camera directly, no relay needed
+  // OBS is a receiver — hand it the watch page so it plays the WebRTC stream
+  // (the broadcast page would make OBS ask for a camera it doesn't have)
   const copyObsUrl = () => {
-    navigator.clipboard.writeText(`${window.location.origin}/broadcast?room=${room}&obs=1`);
+    navigator.clipboard.writeText(`${window.location.origin}/watch?room=${room}&obs=1`);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -144,7 +145,7 @@ function SingleRoomObs({ room }: { room: string }) {
       <video
         ref={remoteVideoRef}
         autoPlay playsInline
-        className="w-full h-full object-cover"
+        className="w-full h-full object-contain"
         onLoadedMetadata={(e) => (e.currentTarget as HTMLVideoElement).play()}
         onStalled={(e) => (e.currentTarget as HTMLVideoElement).play().catch(() => {})}
         onSuspend={(e) => (e.currentTarget as HTMLVideoElement).play().catch(() => {})}

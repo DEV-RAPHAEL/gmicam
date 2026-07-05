@@ -26,7 +26,7 @@ export function useCamera() {
   const [permission, setPermission] = useState<PermissionState>('idle');
   const [devices, setDevices] = useState<CameraDevice[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
-  const [facingMode, setFacingMode] = useState<FacingMode>('user');
+  const [facingMode, setFacingMode] = useState<FacingMode>('environment');
   const [mirror, setMirror] = useState(false);
   const [fps, setFps] = useState<FpsOption>(30);
   const [actualResolution, setActualResolution] = useState<{ w: number; h: number } | null>(null);
@@ -77,12 +77,14 @@ export function useCamera() {
             deviceId: { exact: deviceId },
             width: { ideal: 3840 },
             height: { ideal: 2160 },
+            aspectRatio: { ideal: 16 / 9 },
             frameRate: { ideal: useFps, max: useFps },
           }
         : {
             facingMode: facing ?? facingMode,
             width: { ideal: 3840 },
             height: { ideal: 2160 },
+            aspectRatio: { ideal: 16 / 9 },
             frameRate: { ideal: useFps, max: useFps },
           };
 
