@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchIceServers } from '@/lib/ice';
+import { fetchIceServersInfo } from '@/lib/ice';
 
 export type BroadcastStatus = 'idle' | 'offering' | 'waiting' | 'connected' | 'error';
 
@@ -23,6 +23,7 @@ interface PeerEntry {
 // room with its own offer; we answer each on a dedicated RTCPeerConnection.
 export function useBroadcast(room: string, streamRef: React.RefObject<MediaStream | null>) {
   const [status, setStatus] = useState<BroadcastStatus>('idle');
+  const [turnInfo, setTurnInfo] = useState<{ turn: boolean; reason?: string } | null>(null);
   const genRef = useRef(0);
   const peersRef = useRef<Map<string, PeerEntry>>(new Map());
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -66,10 +67,14 @@ export function useBroadcast(room: string, streamRef: React.RefObject<MediaStrea
     peersRef.current.set(viewerId, entry);
 
     try {
-      const iceServers = await fetchIceServers();
+      const iceInfo = await fetchIceServersInfo();
       if (genRef.current !== gen) return;
+      setTurnInfo({ turn: iceInfo.turn, reason: iceInfo.reason });
+      if (!iceInfo.turn) {
+        console.warn(`[Broadcast:${room}] no TURN servers available (${iceInfo.reason ?? 'unknown'}) — only same-network or STUN-friendly viewers will connect`);
+      }
 
-      const pc = new RTCPeerConnection({ iceServers });
+      const pc = new RTCPeerConnection({ iceServers: iceInfo.servers });
       entry.pc = pc;
 
       pc.onicecandidate = (e) => {
@@ -233,5 +238,5 @@ export function useBroadcast(room: string, streamRef: React.RefObject<MediaStrea
 
   useEffect(() => () => { stop(); }, [stop]);
 
-  return { status, start, stop, replaceTrack };
+  return { status, turnInfo, start, stop, replaceTrack };
 }

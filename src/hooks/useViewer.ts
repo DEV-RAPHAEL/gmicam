@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchIceServers } from '@/lib/ice';
+import { fetchIceServersInfo } from '@/lib/ice';
 
 export type ViewerStatus = 'waiting' | 'connecting' | 'connected';
 
@@ -84,12 +84,16 @@ export function useViewer(room: string) {
           setStatus('connecting');
 
           const id = crypto.randomUUID();
-          const iceServers = await fetchIceServers();
+          const iceInfo = await fetchIceServersInfo();
           if (genRef.current !== gen) return;
+          if (!iceInfo.turn) {
+            console.warn(`[Viewer:${room}] no TURN servers available (${iceInfo.reason ?? 'unknown'}) — only same-network or STUN-friendly connections will work`);
+          }
 
-          const pc = new RTCPeerConnection({ iceServers });
+          const pc = new RTCPeerConnection({ iceServers: iceInfo.servers });
           const newSess: Session = { id, broadcastId: state.broadcastId, pc, seenCandidates: 0 };
           sessionRef.current = newSess;
+          const turnTag = iceInfo.turn ? 'turn:yes' : `turn:no(${iceInfo.reason ?? '?'})`;
 
           pc.addTransceiver('video', { direction: 'recvonly' });
           pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -143,7 +147,7 @@ export function useViewer(room: string) {
           pc.onconnectionstatechange = () => {
             if (genRef.current !== gen) return;
             const s = pc.connectionState;
-            setIceState(`pc:${s} ice:${pc.iceConnectionState}`);
+            setIceState(`pc:${s} ice:${pc.iceConnectionState} ${turnTag}`);
             if (s === 'connected') { clearGrace(); markConnected(); }
             if (s === 'disconnected') scheduleRestartIfStillDown();
             if (s === 'failed' || s === 'closed') restart();
@@ -152,7 +156,7 @@ export function useViewer(room: string) {
           pc.oniceconnectionstatechange = () => {
             if (genRef.current !== gen) return;
             const s = pc.iceConnectionState;
-            setIceState(`pc:${pc.connectionState} ice:${s}`);
+            setIceState(`pc:${pc.connectionState} ice:${s} ${turnTag}`);
             if (s === 'connected' || s === 'completed') { clearGrace(); markConnected(); }
             if (s === 'disconnected') scheduleRestartIfStillDown();
             if (s === 'failed') restart();

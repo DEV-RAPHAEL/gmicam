@@ -21,7 +21,7 @@ export async function GET() {
   const apiKey = process.env.METERED_API_KEY ?? 'a4c4e72fbc9a1f8b5be4d3ac52bf8567ae1c';
 
   if (!domain || !apiKey) {
-    return NextResponse.json({ iceServers: FALLBACK, turn: false });
+    return NextResponse.json({ iceServers: FALLBACK, turn: false, reason: 'not-configured' });
   }
 
   if (cached && Date.now() - cached.at < CACHE_MS) {
@@ -33,12 +33,18 @@ export async function GET() {
       `https://${domain}/api/v1/turn/credentials?apiKey=${apiKey}`,
       { cache: 'no-store' }
     );
-    if (!res.ok) throw new Error(`Metered API ${res.status}`);
+    if (!res.ok) {
+      // 401/403 usually means an invalid or quota-exhausted key — surface the
+      // status so the client can show it instead of failing silently as STUN-only.
+      const body = await res.text().catch(() => '');
+      throw new Error(`Metered API ${res.status}${body ? `: ${body.slice(0, 200)}` : ''}`);
+    }
     const servers = (await res.json()) as RTCIceServer[];
     cached = { servers, at: Date.now() };
     return NextResponse.json({ iceServers: servers, turn: true });
   } catch (err) {
-    console.error('[ice-servers] TURN credential fetch failed:', err);
-    return NextResponse.json({ iceServers: FALLBACK, turn: false });
+    const reason = err instanceof Error ? err.message : 'unknown error';
+    console.error('[ice-servers] TURN credential fetch failed:', reason);
+    return NextResponse.json({ iceServers: FALLBACK, turn: false, reason });
   }
 }

@@ -16,7 +16,7 @@ function BroadcastInner() {
   const room = params.get('room') ?? 'cam1';
 
   const cam = useCamera();
-  const { status, start, replaceTrack } = useBroadcast(room, cam.stream);
+  const { status, turnInfo, start, replaceTrack } = useBroadcast(room, cam.stream);
 
   const [obsMode] = useState(() => isOBSBrowser() || params.get('obs') === '1');
   const [zoom, setZoom] = useState(1);
@@ -175,14 +175,22 @@ function BroadcastInner() {
           )}
 
           {/* Status — bottom right */}
-          <div className="absolute bottom-8 right-4 z-20 text-xs font-semibold" style={{ color: statusColor }}>
-            {{
-              idle: 'Starting…',
-              offering: 'Setting up…',
-              waiting: 'Waiting for viewer',
-              connected: 'Viewer connected',
-              error: 'Error',
-            }[status]}
+          <div className="absolute bottom-8 right-4 z-20 flex flex-col items-end gap-0.5">
+            <span className="text-xs font-semibold" style={{ color: statusColor }}>
+              {{
+                idle: 'Starting…',
+                offering: 'Setting up…',
+                waiting: 'Waiting for viewer',
+                connected: 'Viewer connected',
+                error: 'Error',
+              }[status]}
+            </span>
+            {/* TURN status — if this ever reads "no", cross-network viewers can't connect */}
+            {turnInfo && (
+              <span className={`text-[10px] font-mono ${turnInfo.turn ? 'text-white/30' : 'text-red-400'}`}>
+                {turnInfo.turn ? 'turn:yes' : `turn:no (${turnInfo.reason ?? 'unknown'})`}
+              </span>
+            )}
           </div>
         </>
       )}
