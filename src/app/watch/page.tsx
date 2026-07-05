@@ -161,8 +161,6 @@ export default function WatchPage() {
   const obsMode = isOBSBrowser() || searchParams?.get('obs') === '1';
   const obsRoom = searchParams?.get('room');
 
-  if (obsMode && obsRoom) return <SingleRoomObs room={obsRoom} />;
-
   const pollRooms = useCallback(async () => {
     try {
       const res = await fetch('/api/signal?list=1');
@@ -171,12 +169,14 @@ export default function WatchPage() {
     } catch { /* ignore */ }
   }, []);
 
-  // eslint-disable-next-line react-hooks/rules-of-hooks
   useEffect(() => {
+    if (obsMode && obsRoom) return;
     pollRooms();
     const id = setInterval(pollRooms, 3000);
     return () => clearInterval(id);
-  }, [pollRooms]);
+  }, [pollRooms, obsMode, obsRoom]);
+
+  if (obsMode && obsRoom) return <SingleRoomObs room={obsRoom} />;
 
   const gridCols =
     rooms.length <= 1 ? 'grid-cols-1' :

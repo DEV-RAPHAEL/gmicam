@@ -5,30 +5,52 @@ import { fetchIceServers } from '@/lib/ice';
 
 export type ViewerStatus = 'waiting' | 'connecting' | 'connected';
 
-async function signal(room: string, type: string, data?: unknown) {
+async function signal(room: string, type: string, viewerId?: string, data?: unknown) {
   await fetch(`/api/signal?room=${encodeURIComponent(room)}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ type, data }),
+    body: JSON.stringify({ type, viewerId, data }),
   });
 }
 
+interface Session {
+  id: string;          // our unique viewerId — many viewers can watch one room
+  broadcastId: string; // which broadcast we joined; reconnect when it changes
+  pc: RTCPeerConnection;
+  seenCandidates: number;
+}
+
+// Watches a room by sending our own recvonly offer under a fresh viewerId,
+// then polling for the broadcaster's answer + trickled ICE candidates.
 export function useViewer(room: string) {
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const [status, setStatus] = useState<ViewerStatus>('waiting');
   const [iceState, setIceState] = useState<string>('');
 
   const genRef = useRef(0);
-  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const sessionRef = useRef<Session | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastOfferSdpRef = useRef<string>('');
+
+  // Serialize our signal writes so 'join' always lands before its ICE candidates
+  const sendQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const post = useCallback((type: string, viewerId: string, data?: unknown) => {
+    sendQueueRef.current = sendQueueRef.current
+      .then(() => signal(room, type, viewerId, data))
+      .catch(() => {});
+    return sendQueueRef.current;
+  }, [room]);
 
   const clearTimer = () => { if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; } };
 
-  const closePC = useCallback(() => {
-    pcRef.current?.close();
-    pcRef.current = null;
-  }, []);
+  const teardown = useCallback(() => {
+    const sess = sessionRef.current;
+    if (sess) {
+      sess.pc.close();
+      post('leave', sess.id);
+    }
+    sessionRef.current = null;
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+  }, [post]);
 
   const loop = useCallback((gen: number) => {
     clearTimer();
@@ -37,118 +59,113 @@ export function useViewer(room: string) {
       if (genRef.current !== gen) return;
 
       try {
-        const res = await fetch(`/api/signal?room=${encodeURIComponent(room)}`);
+        const sess = sessionRef.current;
+        const res = await fetch(
+          `/api/signal?room=${encodeURIComponent(room)}&viewer=${encodeURIComponent(sess?.id ?? '')}`
+        );
         const state = await res.json() as {
-          offer: RTCSessionDescriptionInit | null;
-          broadcasterCandidates: RTCIceCandidateInit[];
+          broadcastId: string | null;
+          answer: RTCSessionDescriptionInit | null;
+          candidates: RTCIceCandidateInit[];
         };
 
         if (genRef.current !== gen) return;
 
-        if (!state.offer) {
+        if (!state.broadcastId) {
+          if (sess) teardown();
           setStatus('waiting');
-          closePC();
-          lastOfferSdpRef.current = '';
           timerRef.current = setTimeout(() => loop(gen), 1200);
           return;
         }
 
-        const offerSdp = state.offer.sdp ?? '';
+        // No session yet, or the broadcaster restarted — join with a fresh viewerId
+        if (!sess || sess.broadcastId !== state.broadcastId) {
+          teardown();
+          setStatus('connecting');
 
-        // Already connected to this exact offer — just keep polling for new ICE
-        if (pcRef.current && offerSdp === lastOfferSdpRef.current &&
-          (pcRef.current.connectionState === 'connected' || pcRef.current.iceConnectionState === 'connected' || pcRef.current.iceConnectionState === 'completed')) {
-          timerRef.current = setTimeout(() => loop(gen), 1000);
+          const id = crypto.randomUUID();
+          const iceServers = await fetchIceServers();
+          if (genRef.current !== gen) return;
+
+          const pc = new RTCPeerConnection({ iceServers });
+          const newSess: Session = { id, broadcastId: state.broadcastId, pc, seenCandidates: 0 };
+          sessionRef.current = newSess;
+
+          pc.addTransceiver('video', { direction: 'recvonly' });
+          pc.addTransceiver('audio', { direction: 'recvonly' });
+
+          pc.ontrack = (e) => {
+            const video = remoteVideoRef.current;
+            if (!video) return;
+            if (e.streams[0]) { video.srcObject = e.streams[0]; return; }
+            // Broadcaster attaches tracks via replaceTrack, so there may be no stream association
+            let ms = video.srcObject as MediaStream | null;
+            if (!ms) { ms = new MediaStream(); video.srcObject = ms; }
+            ms.addTrack(e.track);
+          };
+
+          pc.onicecandidate = (e) => {
+            if (e.candidate && genRef.current === gen && sessionRef.current === newSess) {
+              post('ice-viewer', id, e.candidate.toJSON());
+            }
+          };
+
+          // Listen to BOTH connectionState AND iceConnectionState
+          // Some browsers/networks get ICE connected but connectionState stays 'connecting'
+          const markConnected = () => {
+            if (genRef.current === gen) setStatus('connected');
+          };
+
+          const restart = () => {
+            if (genRef.current !== gen || sessionRef.current !== newSess) return;
+            teardown();
+            setStatus('waiting');
+            clearTimer();
+            timerRef.current = setTimeout(() => loop(gen), 800);
+          };
+
+          pc.onconnectionstatechange = () => {
+            if (genRef.current !== gen) return;
+            const s = pc.connectionState;
+            setIceState(`pc:${s} ice:${pc.iceConnectionState}`);
+            if (s === 'connected') markConnected();
+            if (s === 'disconnected' || s === 'failed' || s === 'closed') restart();
+          };
+
+          pc.oniceconnectionstatechange = () => {
+            if (genRef.current !== gen) return;
+            const s = pc.iceConnectionState;
+            setIceState(`pc:${pc.connectionState} ice:${s}`);
+            if (s === 'connected' || s === 'completed') markConnected();
+            if (s === 'failed') restart();
+          };
+
+          const offer = await pc.createOffer();
+          if (genRef.current !== gen || sessionRef.current !== newSess) { pc.close(); return; }
+          await pc.setLocalDescription(offer);
+          await post('join', id, offer);
+
+          timerRef.current = setTimeout(() => loop(gen), 500);
           return;
         }
 
-        // New offer — (re)connect
-        closePC();
-        lastOfferSdpRef.current = offerSdp;
-        setStatus('connecting');
-
-        const iceServers = await fetchIceServers();
-        if (genRef.current !== gen) return;
-        const pc = new RTCPeerConnection({ iceServers });
-        pcRef.current = pc;
-
-        pc.ontrack = (e) => {
-          if (remoteVideoRef.current && e.streams[0]) {
-            remoteVideoRef.current.srcObject = e.streams[0];
-          }
-        };
-
-        pc.onicecandidate = (e) => {
-          if (e.candidate && genRef.current === gen) {
-            signal(room, 'ice-viewer', e.candidate.toJSON());
-          }
-        };
-
-        // Listen to BOTH connectionState AND iceConnectionState
-        // Some browsers/networks get ICE connected but connectionState stays 'connecting'
-        const markConnected = () => {
-          if (genRef.current === gen) setStatus('connected');
-        };
-
-        pc.onconnectionstatechange = () => {
-          if (genRef.current !== gen) return;
-          const s = pc.connectionState;
-          setIceState(`pc:${s} ice:${pc.iceConnectionState}`);
-          if (s === 'connected') markConnected();
-          if (s === 'disconnected' || s === 'failed' || s === 'closed') {
-            pcRef.current?.close();
-            pcRef.current = null;
-            lastOfferSdpRef.current = '';
-            setStatus('waiting');
-            loop(gen);
-          }
-        };
-
-        pc.oniceconnectionstatechange = () => {
-          if (genRef.current !== gen) return;
-          const s = pc.iceConnectionState;
-          setIceState(`pc:${pc.connectionState} ice:${s}`);
-          if (s === 'connected' || s === 'completed') markConnected();
-          if (s === 'failed') {
-            // ICE failed — try restarting
-            pcRef.current?.close();
-            pcRef.current = null;
-            lastOfferSdpRef.current = '';
-            setStatus('waiting');
-            timerRef.current = setTimeout(() => loop(gen), 1000);
-          }
-        };
-
-        await pc.setRemoteDescription(state.offer);
-
-        let knownCandidates = state.broadcasterCandidates.length;
-        for (const c of state.broadcasterCandidates) {
-          try { await pc.addIceCandidate(c); } catch { /* ok */ }
+        // Existing session — apply the answer once, then trickle new candidates
+        const pc = sess.pc;
+        if (state.answer && !pc.remoteDescription) {
+          await pc.setRemoteDescription(state.answer);
+        }
+        if (pc.remoteDescription) {
+          const fresh = state.candidates.slice(sess.seenCandidates);
+          sess.seenCandidates = state.candidates.length;
+          for (const c of fresh) { try { await pc.addIceCandidate(c); } catch { /* ok */ } }
         }
 
-        const answer = await pc.createAnswer();
-        if (genRef.current !== gen) { pc.close(); return; }
-        await pc.setLocalDescription(answer);
-        await signal(room, 'answer', answer);
-
-        // Poll for new broadcaster ICE candidates
-        const pollICE = async () => {
-          if (genRef.current !== gen || !pcRef.current) return;
-          try {
-            const r = await fetch(`/api/signal?room=${encodeURIComponent(room)}`);
-            const s = await r.json() as { broadcasterCandidates: RTCIceCandidateInit[]; offer: RTCSessionDescriptionInit | null };
-            if (!s.offer || (s.offer.sdp ?? '') !== lastOfferSdpRef.current) {
-              lastOfferSdpRef.current = '';
-              timerRef.current = setTimeout(() => loop(gen), 300);
-              return;
-            }
-            const newOnes = s.broadcasterCandidates.slice(knownCandidates);
-            for (const c of newOnes) { try { await pc.addIceCandidate(c); } catch { /* ok */ } }
-            knownCandidates = s.broadcasterCandidates.length;
-          } catch { /* ok */ }
-          if (genRef.current === gen) timerRef.current = setTimeout(pollICE, 600);
-        };
-        pollICE();
+        const connected =
+          pc.connectionState === 'connected' ||
+          pc.iceConnectionState === 'connected' ||
+          pc.iceConnectionState === 'completed';
+        // Once connected, poll slowly just to notice broadcaster restarts
+        timerRef.current = setTimeout(() => loop(gen), connected ? 2000 : 700);
 
       } catch (err) {
         console.error(`[Viewer:${room}]`, err);
@@ -157,24 +174,22 @@ export function useViewer(room: string) {
     };
 
     run();
-  }, [room, closePC]);
+  }, [room, post, teardown]);
 
   const connect = useCallback(() => {
     const gen = ++genRef.current;
-    closePC();
-    lastOfferSdpRef.current = '';
+    clearTimer();
+    teardown();
     setStatus('waiting');
     loop(gen);
-  }, [closePC, loop]);
+  }, [teardown, loop]);
 
   const disconnect = useCallback(() => {
     ++genRef.current;
     clearTimer();
-    closePC();
-    lastOfferSdpRef.current = '';
+    teardown();
     setStatus('waiting');
-    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-  }, [closePC]);
+  }, [teardown]);
 
   useEffect(() => {
     connect();

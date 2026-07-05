@@ -1,10 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { readRoom, writeRoom, deleteRoom, listActiveRooms, RoomState } from '@/lib/signalStore';
+import {
+  setBroadcaster, getBroadcastId, resetRoom, listActiveRooms,
+  putViewerOffer, addViewerCandidate, listViewerOffers,
+  putAnswer, addAnswerCandidate, getAnswer,
+  removeViewer, pruneViewers,
+} from '@/lib/signalStore';
 
 export const dynamic = 'force-dynamic';
 
-// GET /api/signal?room=cam1        — state for one room
-// GET /api/signal?list=1           — list active room IDs
+// Viewer join records older than this are considered abandoned
+const VIEWER_TTL_MS = 3 * 60_000;
+
+// GET /api/signal?list=1                 — list active room IDs
+// GET /api/signal?room=cam1              — broadcaster poll: pending viewer offers
+// GET /api/signal?room=cam1&viewer=<id>  — viewer poll: answer + broadcaster ICE
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
 
@@ -14,49 +23,68 @@ export async function GET(req: NextRequest) {
   }
 
   const room = searchParams.get('room') ?? 'default';
-  const state = await readRoom(room);
-  return NextResponse.json(state);
+  const broadcastId = await getBroadcastId(room);
+
+  if (searchParams.has('viewer')) {
+    const viewerId = searchParams.get('viewer') ?? '';
+    const entry = viewerId && broadcastId ? await getAnswer(room, viewerId) : null;
+    return NextResponse.json({
+      broadcastId,
+      answer: entry?.answer ?? null,
+      candidates: entry?.candidates ?? [],
+    });
+  }
+
+  const viewers = broadcastId ? await listViewerOffers(room) : [];
+  return NextResponse.json({ broadcastId, viewers });
 }
 
-// POST /api/signal?room=cam1       — write a signal message
+// POST /api/signal?room=cam1 — write a signal message
 export async function POST(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const room = searchParams.get('room') ?? 'default';
 
   const body = await req.json() as {
-    type: 'offer' | 'answer' | 'ice-broadcaster' | 'ice-viewer' | 'reset' | 'heartbeat';
-    data?: RTCSessionDescriptionInit | RTCIceCandidateInit;
+    type: 'announce' | 'reset' | 'join' | 'ice-viewer' | 'answer' | 'ice-broadcaster' | 'leave';
+    viewerId?: string;
+    data?: unknown;
   };
 
-  if (body.type === 'reset') {
-    await deleteRoom(room);
-    return NextResponse.json({ ok: true });
+  switch (body.type) {
+    case 'announce': {
+      const { broadcastId } = (body.data ?? {}) as { broadcastId?: string };
+      if (!broadcastId) return NextResponse.json({ error: 'broadcastId required' }, { status: 400 });
+      await setBroadcaster(room, broadcastId);
+      await pruneViewers(room, VIEWER_TTL_MS);
+      return NextResponse.json({ ok: true });
+    }
+    case 'reset':
+      await resetRoom(room);
+      return NextResponse.json({ ok: true });
   }
 
-  const state: RoomState = await readRoom(room);
+  const viewerId = body.viewerId;
+  if (!viewerId) return NextResponse.json({ error: 'viewerId required' }, { status: 400 });
 
   switch (body.type) {
-    case 'offer':
-      state.offer = body.data as RTCSessionDescriptionInit;
-      state.answer = null;
-      state.viewerCandidates = [];
-      state.broadcasterCandidates = [];
-      break;
-    case 'answer':
-      state.answer = body.data as RTCSessionDescriptionInit;
-      break;
-    case 'ice-broadcaster':
-      state.broadcasterCandidates.push(body.data as RTCIceCandidateInit);
+    case 'join':
+      await putViewerOffer(room, viewerId, body.data as RTCSessionDescriptionInit);
       break;
     case 'ice-viewer':
-      state.viewerCandidates.push(body.data as RTCIceCandidateInit);
+      await addViewerCandidate(room, viewerId, body.data as RTCIceCandidateInit);
       break;
-    case 'heartbeat':
-      // just bumps lastSeen
+    case 'answer':
+      await putAnswer(room, viewerId, body.data as RTCSessionDescriptionInit);
       break;
+    case 'ice-broadcaster':
+      await addAnswerCandidate(room, viewerId, body.data as RTCIceCandidateInit);
+      break;
+    case 'leave':
+      await removeViewer(room, viewerId);
+      break;
+    default:
+      return NextResponse.json({ error: 'unknown type' }, { status: 400 });
   }
 
-  state.version++;
-  await writeRoom(room, state);
-  return NextResponse.json({ ok: true, version: state.version });
+  return NextResponse.json({ ok: true });
 }
