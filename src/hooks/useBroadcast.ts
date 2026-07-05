@@ -5,146 +5,211 @@ import { fetchIceServers } from '@/lib/ice';
 
 export type BroadcastStatus = 'idle' | 'offering' | 'waiting' | 'connected' | 'error';
 
-async function signal(room: string, type: string, data?: unknown) {
+async function signal(room: string, type: string, viewerId?: string, data?: unknown) {
   await fetch(`/api/signal?room=${encodeURIComponent(room)}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ type, data }),
+    body: JSON.stringify({ type, viewerId, data }),
   });
 }
 
+interface PeerEntry {
+  pc: RTCPeerConnection | null;
+  seenCandidates: number;
+  ready: boolean; // answer posted — safe to trickle further candidates
+}
+
+// Broadcasts the camera stream to any number of viewers. Each viewer joins the
+// room with its own offer; we answer each on a dedicated RTCPeerConnection.
 export function useBroadcast(room: string, streamRef: React.RefObject<MediaStream | null>) {
   const [status, setStatus] = useState<BroadcastStatus>('idle');
   const genRef = useRef(0);
-  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const peersRef = useRef<Map<string, PeerEntry>>(new Map());
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Serialize our signal writes so 'answer' always lands before its ICE candidates
+  const sendQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const post = useCallback((type: string, viewerId?: string, data?: unknown) => {
+    sendQueueRef.current = sendQueueRef.current
+      .then(() => signal(room, type, viewerId, data))
+      .catch(() => {});
+    return sendQueueRef.current;
+  }, [room]);
 
   const clearTimers = () => {
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
     if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
   };
 
-  const offer = useCallback(async (gen: number) => {
-    if (genRef.current !== gen) return;
+  const closeAllPeers = useCallback(() => {
+    peersRef.current.forEach((e) => e.pc?.close());
+    peersRef.current.clear();
+  }, []);
 
+  const updateStatus = useCallback((gen: number) => {
+    if (genRef.current !== gen) return;
+    const anyConnected = [...peersRef.current.values()].some((e) => e.pc?.connectionState === 'connected');
+    setStatus(anyConnected ? 'connected' : 'waiting');
+  }, []);
+
+  const createPeer = useCallback(async (
+    gen: number,
+    viewerId: string,
+    offer: RTCSessionDescriptionInit,
+    candidates: RTCIceCandidateInit[],
+  ) => {
     const stream = streamRef.current;
-    if (!stream || stream.getTracks().length === 0) {
-      // Stream not ready yet — retry shortly
-      timerRef.current = setTimeout(() => offer(gen), 500);
-      return;
-    }
+    if (!stream) return;
 
-    setStatus('offering');
-    await signal(room, 'reset');
-    if (genRef.current !== gen) return;
+    const entry: PeerEntry = { pc: null, seenCandidates: 0, ready: false };
+    peersRef.current.set(viewerId, entry);
 
-    const iceServers = await fetchIceServers();
-    if (genRef.current !== gen) return;
-    const pc = new RTCPeerConnection({ iceServers });
-    pcRef.current = pc;
-
-    stream.getTracks().forEach((t) => pc.addTrack(t, stream));
-
-    pc.onicecandidate = (e) => {
-      if (e.candidate && genRef.current === gen) {
-        signal(room, 'ice-broadcaster', e.candidate.toJSON());
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
+    try {
+      const iceServers = await fetchIceServers();
       if (genRef.current !== gen) return;
-      const s = pc.connectionState;
-      if (s === 'connected') {
-        setStatus('connected');
-        // Cap bitrate and prefer dropping resolution over frames on poor networks
-        pc.getSenders().forEach(async (sender) => {
-          if (sender.track?.kind !== 'video') return;
-          try {
-            const params = sender.getParameters();
-            if (!params.encodings?.length) params.encodings = [{}];
-            params.encodings[0].maxBitrate = 4_000_000; // 4 Mbps ceiling
-            await sender.setParameters(params);
-          } catch { /* not all browsers support this */ }
-        });
-      }
-      if (s === 'disconnected' || s === 'failed' || s === 'closed') {
-        // Clean up and re-offer automatically — viewer can reconnect at any time
-        pc.close();
-        if (pcRef.current === pc) pcRef.current = null;
-        clearTimers();
-        setStatus('waiting');
-        timerRef.current = setTimeout(() => offer(gen), 800);
-      }
-    };
 
-    const sdpOffer = await pc.createOffer();
-    if (genRef.current !== gen) { pc.close(); return; }
-    await pc.setLocalDescription(sdpOffer);
-    await signal(room, 'offer', sdpOffer);
-    setStatus('waiting');
+      const pc = new RTCPeerConnection({ iceServers });
+      entry.pc = pc;
 
-    // Heartbeat keeps room alive — every 4s so a few failures don't expire the room
-    heartbeatRef.current = setInterval(() => {
-      if (genRef.current === gen) signal(room, 'heartbeat').catch(() => {});
-    }, 4_000);
-
-    let knownViewerCandidates = 0;
-    let lastVersion = -1;
-
-    const poll = async () => {
-      if (genRef.current !== gen || !pcRef.current) return;
-      try {
-        const res = await fetch(`/api/signal?room=${encodeURIComponent(room)}`);
-        const state = await res.json() as {
-          answer: RTCSessionDescriptionInit | null;
-          viewerCandidates: RTCIceCandidateInit[];
-          version: number;
-        };
-
-        if (genRef.current !== gen) return;
-
-        if (state.version !== lastVersion) {
-          lastVersion = state.version;
-          if (state.answer && pc.remoteDescription === null) {
-            await pc.setRemoteDescription(state.answer);
-          }
-          const newOnes = state.viewerCandidates.slice(knownViewerCandidates);
-          for (const c of newOnes) { try { await pc.addIceCandidate(c); } catch { /* ok */ } }
-          knownViewerCandidates = state.viewerCandidates.length;
+      pc.onicecandidate = (e) => {
+        if (e.candidate && genRef.current === gen) {
+          post('ice-broadcaster', viewerId, e.candidate.toJSON());
         }
-      } catch { /* ok */ }
-      if (genRef.current === gen) timerRef.current = setTimeout(poll, 800);
-    };
+      };
 
-    poll();
-  }, [room, streamRef]);
+      pc.onconnectionstatechange = () => {
+        if (genRef.current !== gen) return;
+        const s = pc.connectionState;
+        if (s === 'connected') {
+          // Cap bitrate and prefer dropping resolution over frames on poor networks
+          pc.getSenders().forEach(async (sender) => {
+            if (sender.track?.kind !== 'video') return;
+            try {
+              const params = sender.getParameters();
+              if (!params.encodings?.length) params.encodings = [{}];
+              params.encodings[0].maxBitrate = 4_000_000; // 4 Mbps ceiling
+              await sender.setParameters(params);
+            } catch { /* not all browsers support this */ }
+          });
+        }
+        if (s === 'disconnected' || s === 'failed' || s === 'closed') {
+          pc.close();
+          if (peersRef.current.get(viewerId)?.pc === pc) peersRef.current.delete(viewerId);
+          post('leave', viewerId); // viewer rejoins with a fresh ID if it's still there
+        }
+        updateStatus(gen);
+      };
+
+      await pc.setRemoteDescription(offer);
+
+      // Attach our tracks to the recvonly transceivers the viewer offered
+      for (const t of pc.getTransceivers()) {
+        const kind = t.receiver.track?.kind;
+        const local = stream.getTracks().find((tr) => tr.kind === kind);
+        if (local) {
+          await t.sender.replaceTrack(local);
+          t.direction = 'sendonly';
+        }
+      }
+
+      for (const c of candidates) { try { await pc.addIceCandidate(c); } catch { /* ok */ } }
+      entry.seenCandidates = candidates.length;
+
+      const answer = await pc.createAnswer();
+      if (genRef.current !== gen) { pc.close(); return; }
+      await pc.setLocalDescription(answer);
+      await post('answer', viewerId, answer);
+      entry.ready = true;
+    } catch (err) {
+      console.error(`[Broadcast:${room}] viewer ${viewerId}`, err);
+      entry.pc?.close();
+      if (peersRef.current.get(viewerId) === entry) peersRef.current.delete(viewerId);
+    }
+  }, [room, streamRef, post, updateStatus]);
+
+  const poll = useCallback(async (gen: number) => {
+    if (genRef.current !== gen) return;
+    try {
+      const res = await fetch(`/api/signal?room=${encodeURIComponent(room)}`);
+      const state = await res.json() as {
+        viewers: { id: string; offer: RTCSessionDescriptionInit; candidates: RTCIceCandidateInit[] }[];
+      };
+      if (genRef.current !== gen) return;
+
+      for (const v of state.viewers) {
+        const entry = peersRef.current.get(v.id);
+        if (!entry) {
+          createPeer(gen, v.id, v.offer, v.candidates); // async — entry registered synchronously inside
+          continue;
+        }
+        if (!entry.ready || !entry.pc) continue; // still answering — its candidates get picked up next poll
+        const fresh = v.candidates.slice(entry.seenCandidates);
+        entry.seenCandidates = v.candidates.length;
+        for (const c of fresh) { try { await entry.pc.addIceCandidate(c); } catch { /* ok */ } }
+      }
+    } catch { /* ok */ }
+    if (genRef.current === gen) timerRef.current = setTimeout(() => poll(gen), 800);
+  }, [room, createPeer]);
 
   const start = useCallback(() => {
     const gen = ++genRef.current;
     clearTimers();
-    pcRef.current?.close();
-    pcRef.current = null;
-    offer(gen);
-  }, [offer]);
+    closeAllPeers();
+
+    const begin = async () => {
+      if (genRef.current !== gen) return;
+
+      const stream = streamRef.current;
+      if (!stream || stream.getTracks().length === 0) {
+        // Stream not ready yet — retry shortly
+        timerRef.current = setTimeout(begin, 500);
+        return;
+      }
+
+      setStatus('offering');
+      const broadcastId = crypto.randomUUID();
+      try {
+        await signal(room, 'reset');
+        await signal(room, 'announce', undefined, { broadcastId });
+      } catch {
+        if (genRef.current === gen) {
+          setStatus('error');
+          timerRef.current = setTimeout(begin, 2000);
+        }
+        return;
+      }
+      if (genRef.current !== gen) return;
+      setStatus('waiting');
+
+      // Heartbeat keeps the room listed as live — every 4s so a few failures don't expire it
+      heartbeatRef.current = setInterval(() => {
+        if (genRef.current === gen) signal(room, 'announce', undefined, { broadcastId }).catch(() => {});
+      }, 4_000);
+
+      poll(gen);
+    };
+
+    begin();
+  }, [room, streamRef, poll, closeAllPeers]);
 
   const stop = useCallback(async () => {
     ++genRef.current;
     clearTimers();
-    pcRef.current?.close();
-    pcRef.current = null;
+    closeAllPeers();
     await signal(room, 'reset').catch(() => {});
     setStatus('idle');
-  }, [room]);
+  }, [room, closeAllPeers]);
 
-  // Replace video track without renegotiating
+  // Replace video track on every viewer connection without renegotiating
   const replaceTrack = useCallback(async (newStream: MediaStream) => {
-    const pc = pcRef.current;
-    if (!pc) return;
     const track = newStream.getVideoTracks()[0];
     if (!track) return;
-    const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
-    if (sender) await sender.replaceTrack(track);
+    for (const { pc } of peersRef.current.values()) {
+      if (!pc) continue;
+      const tx = pc.getTransceivers().find((t) => t.receiver.track?.kind === 'video');
+      if (tx) await tx.sender.replaceTrack(track);
+    }
   }, []);
 
   useEffect(() => () => { stop(); }, [stop]);
