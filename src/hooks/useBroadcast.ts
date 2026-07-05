@@ -78,10 +78,32 @@ export function useBroadcast(room: string, streamRef: React.RefObject<MediaStrea
         }
       };
 
+      let graceTimer: ReturnType<typeof setTimeout> | null = null;
+      const dropPeer = () => {
+        if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+        pc.close();
+        if (peersRef.current.get(viewerId)?.pc === pc) peersRef.current.delete(viewerId);
+        post('leave', viewerId); // viewer rejoins with a fresh ID if it's still there
+        updateStatus(gen);
+      };
+
+      // 'disconnected' is often transient (brief WiFi blip, NAT rebind, cellular
+      // handoff) and self-heals within a few seconds — only drop the viewer if it
+      // hasn't recovered by then. 'failed'/'closed' are terminal.
+      const scheduleDropIfStillDown = () => {
+        if (graceTimer) return;
+        graceTimer = setTimeout(() => {
+          graceTimer = null;
+          if (genRef.current !== gen) return;
+          if (pc.connectionState === 'disconnected' || pc.iceConnectionState === 'disconnected') dropPeer();
+        }, 4000);
+      };
+
       pc.onconnectionstatechange = () => {
         if (genRef.current !== gen) return;
         const s = pc.connectionState;
         if (s === 'connected') {
+          if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
           // Cap bitrate and prefer dropping resolution over frames on poor networks
           pc.getSenders().forEach(async (sender) => {
             if (sender.track?.kind !== 'video') return;
@@ -93,11 +115,8 @@ export function useBroadcast(room: string, streamRef: React.RefObject<MediaStrea
             } catch { /* not all browsers support this */ }
           });
         }
-        if (s === 'disconnected' || s === 'failed' || s === 'closed') {
-          pc.close();
-          if (peersRef.current.get(viewerId)?.pc === pc) peersRef.current.delete(viewerId);
-          post('leave', viewerId); // viewer rejoins with a fresh ID if it's still there
-        }
+        if (s === 'disconnected') scheduleDropIfStillDown();
+        if (s === 'failed' || s === 'closed') dropPeer();
         updateStatus(gen);
       };
 

@@ -116,7 +116,11 @@ export function useViewer(room: string) {
             if (genRef.current === gen) setStatus('connected');
           };
 
+          let graceTimer: ReturnType<typeof setTimeout> | null = null;
+          const clearGrace = () => { if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; } };
+
           const restart = () => {
+            clearGrace();
             if (genRef.current !== gen || sessionRef.current !== newSess) return;
             teardown();
             setStatus('waiting');
@@ -124,19 +128,33 @@ export function useViewer(room: string) {
             timerRef.current = setTimeout(() => loop(gen), 800);
           };
 
+          // 'disconnected' is often transient (brief WiFi blip, NAT rebind, cellular
+          // handoff) and self-heals within a few seconds — only tear down and
+          // rejoin if it hasn't recovered by then. 'failed'/'closed' are terminal.
+          const scheduleRestartIfStillDown = () => {
+            if (graceTimer) return;
+            graceTimer = setTimeout(() => {
+              graceTimer = null;
+              if (genRef.current !== gen || sessionRef.current !== newSess) return;
+              if (pc.connectionState === 'disconnected' || pc.iceConnectionState === 'disconnected') restart();
+            }, 4000);
+          };
+
           pc.onconnectionstatechange = () => {
             if (genRef.current !== gen) return;
             const s = pc.connectionState;
             setIceState(`pc:${s} ice:${pc.iceConnectionState}`);
-            if (s === 'connected') markConnected();
-            if (s === 'disconnected' || s === 'failed' || s === 'closed') restart();
+            if (s === 'connected') { clearGrace(); markConnected(); }
+            if (s === 'disconnected') scheduleRestartIfStillDown();
+            if (s === 'failed' || s === 'closed') restart();
           };
 
           pc.oniceconnectionstatechange = () => {
             if (genRef.current !== gen) return;
             const s = pc.iceConnectionState;
             setIceState(`pc:${pc.connectionState} ice:${s}`);
-            if (s === 'connected' || s === 'completed') markConnected();
+            if (s === 'connected' || s === 'completed') { clearGrace(); markConnected(); }
+            if (s === 'disconnected') scheduleRestartIfStillDown();
             if (s === 'failed') restart();
           };
 

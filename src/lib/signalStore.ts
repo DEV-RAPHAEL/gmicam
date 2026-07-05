@@ -46,8 +46,7 @@ const isNetlify = !!process.env.NETLIFY;
 
 async function getBlobStore() {
   const { getStore } = await import('@netlify/blobs');
-  // Strong consistency — signaling handshakes break on stale reads
-  return getStore({ name: 'signal', consistency: 'strong' });
+  return getStore('signal');
 }
 
 // Blob keys — segments are URI-encoded so ':' stays an unambiguous separator
@@ -56,9 +55,19 @@ const roomKey = (room: string) => `room:${enc(room)}`;
 const offerKey = (room: string, viewerId: string) => `vo:${enc(room)}:${enc(viewerId)}`;
 const answerKey = (room: string, viewerId: string) => `va:${enc(room)}:${enc(viewerId)}`;
 
+// Reads on the handshake path (offer/answer/presence) need the freshest value —
+// eventual consistency can serve a stale miss right when a viewer/broadcaster
+// just wrote, which reads as "not connected yet" and stalls the connection.
+// Not every deploy context supports strong reads (it needs an uncachedEdgeURL),
+// so fall back to eventual rather than let the whole read fail.
 async function blobGet<T>(key: string): Promise<T | null> {
   const store = await getBlobStore();
-  return (await store.get(key, { type: 'json' }).catch(() => null)) as T | null;
+  try {
+    return (await store.get(key, { type: 'json', consistency: 'strong' })) as T | null;
+  } catch (err) {
+    console.error(`[signalStore] strong-consistency read failed for ${key}, falling back to eventual:`, err);
+    return (await store.get(key, { type: 'json' }).catch(() => null)) as T | null;
+  }
 }
 
 async function blobSet(key: string, value: unknown): Promise<void> {
